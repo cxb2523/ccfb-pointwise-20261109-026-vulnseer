@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 from pathlib import Path
 
+from detectors import Finding
+from detectors.ssrf_detector import SSRFDetector
+
 # Optional imports for AI providers
 try:
     import openai
@@ -526,9 +529,26 @@ Be honest about limitations in CVE verification rather than guessing."""
             
         return result
 
+# Rule registration/dispatch point for request-level security detectors.
+# Each entry maps a detector instance to the request records it should run
+# against; new detectors register here rather than being special-cased
+# inside VulnerabilityScanner.
+REQUEST_DETECTORS = [
+    SSRFDetector(),
+]
+
+
 class VulnerabilityScanner:
     def __init__(self, providers: List[AIProvider]):
         self.providers = providers
+
+    def run_request_detectors(self, request_records: List[Dict]) -> List[Finding]:
+        """Dispatch each request record through all registered request-level detectors."""
+        findings: List[Finding] = []
+        for record in request_records:
+            for detector in REQUEST_DETECTORS:
+                findings.extend(detector.scan(record))
+        return findings
 
     def parse_targets(self, target_input: str) -> List[str]:
         """Parse target input (file, CIDR, single host)"""
@@ -735,7 +755,8 @@ class VulnerabilityScanner:
         
         return results
 
-    def generate_report(self, results: List[Dict], output_file: str = None, no_cves: bool = False):
+    def generate_report(self, results: List[Dict], output_file: str = None, no_cves: bool = False,
+                         findings: Optional[List[Finding]] = None):
         """Generate final vulnerability report"""
         report = "VULNERABILITY SCAN REPORT\n"
         report += "=" * 50 + "\n"
@@ -782,7 +803,21 @@ class VulnerabilityScanner:
                 report += f"\nDetailed Analysis:\n{result['analysis']['raw_analysis']}\n"
             
             report += "-" * 50 + "\n"
-        
+
+        if findings:
+            report += "\nSSRF / REQUEST-LEVEL FINDINGS\n"
+            report += "=" * 50 + "\n"
+            for finding in findings:
+                report += f"\nRule: {finding.rule_id}\n"
+                report += f"Host: {finding.host}\n"
+                report += f"Severity: {finding.severity}\n"
+                report += f"Status: {finding.status}\n"
+                if finding.bypass_type:
+                    report += f"Bypass Type: {finding.bypass_type}\n"
+                report += f"Evidence: {finding.evidence}\n"
+                report += f"Description: {finding.description}\n"
+                report += "-" * 50 + "\n"
+
         if output_file:
             with open(output_file, 'w') as f:
                 f.write(report)
@@ -818,8 +853,9 @@ class VulnerabilityScanner:
         
         return None
 
-gumentParser(description="AI-Powered Vulnerability Scanner")
-    parser.add_argument("targets", help="Target IP/CIDR/hostname or file containing targets")
+def main():
+    parser = argparse.ArgumentParser(description="AI-Powered Vulnerability Scanner")
+    parser.add_argument("targets", nargs="?", help="Target IP/CIDR/hostname or file containing targets")
     parser.add_argument("--ports", "-p", help="Port specification (e.g., '22,80,443' or '1-1000')")
     parser.add_argument("--openai-key", help="OpenAI API key")
     parser.add_argument("--anthropic-key", help="Anthropic API key") 
@@ -827,11 +863,19 @@ gumentParser(description="AI-Powered Vulnerability Scanner")
     parser.add_argument("--output", "-o", help="Output report file")
     parser.add_argument("--providers", nargs="+", choices=["openai", "anthropic", "groq"], 
                        default=["openai"], help="AI providers to use")
-    parser.add_argument("--no-cves", action="store_true", 
+    parser.add_argument("--no-cves", action="store_true",
                        help="Disable CVE reporting (more conservative, risk assessment only)")
-    
+    parser.add_argument("--self-test", action="store_true",
+                       help="Run built-in detector self-tests (no network, no external packages) and exit")
+
     args = parser.parse_args()
-    
+
+    if args.self_test:
+        sys.exit(run_self_tests())
+
+    if not args.targets:
+        parser.error("targets is required unless --self-test is given")
+
     # Initialize providers based on arguments
     providers = []
     
@@ -867,6 +911,144 @@ gumentParser(description="AI-Powered Vulnerability Scanner")
     scanner = VulnerabilityScanner(providers)
     results = scanner.scan_and_analyze(args.targets, args.ports, args.no_cves)
     scanner.generate_report(results, args.output, args.no_cves)
+
+def run_self_tests() -> int:
+    """Built-in SSRF detector test suite. No network access, no external packages.
+
+    Returns 0 if every case passes, 1 otherwise (so --self-test can drive
+    the process exit code directly).
+    """
+    detector = SSRFDetector()
+    cases = []
+
+    def case(name, request_data, check):
+        cases.append((name, request_data, check))
+
+    # 1. Layer 1 only: loopback URL in a classic sink param, no redirect/DNS
+    #    evidence supplied -> suspected, not confirmed.
+    case(
+        "layer1_loopback_param_suspected",
+        {"host": "app.example.com", "params": {"url": "http://127.0.0.1/admin"}},
+        lambda fs: len(fs) == 1 and fs[0].rule_id == "SSRF-001" and fs[0].status == "suspected",
+    )
+
+    # 2. Layer 1 only: cloud metadata address via callback= -> suspected.
+    case(
+        "layer1_metadata_param_suspected",
+        {"host": "app.example.com", "params": {"callback": "http://169.254.169.254/latest/meta-data/"}},
+        lambda fs: len(fs) == 1 and fs[0].rule_id == "SSRF-001" and fs[0].status == "suspected",
+    )
+
+    # 3. Layer 2: redirect chain bypass. The parameter itself points at an
+    #    external, allow-listed-looking host, but the redirect chain's final
+    #    hop lands on an internal address -> confirmed via SSRF-002.
+    case(
+        "layer2_redirect_chain_bypass_confirmed",
+        {
+            "host": "app.example.com",
+            "params": {"endpoint": "https://safe-redirector.example.com/go"},
+            "redirect_chain": [
+                "https://safe-redirector.example.com/go",
+                "https://safe-redirector.example.com/bounce",
+                "http://192.168.0.5/internal-admin",
+            ],
+        },
+        lambda fs: len(fs) == 1 and fs[0].rule_id == "SSRF-002" and fs[0].status == "confirmed",
+    )
+
+    # 4. Layer 3: DNS rebinding. Domain name looks external, but the
+    #    caller-supplied DNS resolution shows it rebinds to a loopback
+    #    address -> confirmed via SSRF-003 with bypass_type=dns_rebinding.
+    case(
+        "layer3_dns_rebinding_confirmed",
+        {
+            "host": "app.example.com",
+            "params": {"url": "http://attacker-controlled.example.net/webhook"},
+            "resolved_ips": ["127.0.0.1"],
+        },
+        lambda fs: (
+            len(fs) == 1
+            and fs[0].rule_id == "SSRF-003"
+            and fs[0].status == "confirmed"
+            and fs[0].bypass_type == "dns_rebinding"
+        ),
+    )
+
+    # 5. False-positive exclusion: legitimate internal business traffic.
+    #    The request's own host is on an internal CIDR (normal for an
+    #    intranet app) but no parameter carries an SSRF-prone pattern ->
+    #    zero findings, must not be flagged just because the host is
+    #    internal.
+    case(
+        "internal_business_traffic_no_false_positive",
+        {
+            "host": "10.0.3.21",
+            "params": {"page": "2", "sort": "created_at", "name": "quarterly-report"},
+        },
+        lambda fs: len(fs) == 0,
+    )
+
+    # 6. Layer 1 catches internal-CIDR literals (not just loopback), and
+    #    without redirect/DNS evidence it stays suspected, not confirmed.
+    case(
+        "internal_cidr_literal_suspected",
+        {
+            "host": "app.example.com",
+            "params": {"target": "http://10.0.0.5/status"},
+        },
+        lambda fs: len(fs) == 1 and fs[0].rule_id == "SSRF-001" and fs[0].status == "suspected",
+    )
+
+    # 6b. False-positive exclusion: a lexically-external domain name with no
+    #     redirect-chain or DNS-resolution evidence must NOT be flagged --
+    #     every ordinary url= parameter pointing at a third-party domain
+    #     would otherwise become noise.
+    case(
+        "external_domain_without_evidence_no_false_positive",
+        {
+            "host": "app.example.com",
+            "params": {"target": "http://internal.corp.local/status"},
+        },
+        lambda fs: len(fs) == 0,
+    )
+
+    # 7. file:// scheme is SSRF-equivalent local file access -> suspected at
+    #    minimum (no redirect/DNS evidence supplied).
+    case(
+        "file_scheme_param_suspected",
+        {"host": "app.example.com", "params": {"src": "file:///etc/passwd"}},
+        lambda fs: len(fs) == 1 and fs[0].rule_id == "SSRF-001" and fs[0].status == "suspected",
+    )
+
+    # 8. Clean external URL, nothing internal anywhere -> zero findings.
+    case(
+        "external_url_no_findings",
+        {"host": "app.example.com", "params": {"url": "https://api.partner.com/webhook"}},
+        lambda fs: len(fs) == 0,
+    )
+
+    passed = 0
+    failed = 0
+    for name, request_data, check in cases:
+        try:
+            findings = detector.scan(request_data)
+            ok = check(findings)
+        except Exception as e:
+            ok = False
+            print(f"[FAIL] {name} (exception: {e})")
+            failed += 1
+            continue
+
+        if ok:
+            print(f"[PASS] {name}")
+            passed += 1
+        else:
+            print(f"[FAIL] {name} (got: {findings})")
+            failed += 1
+
+    print(f"TOTAL: {passed} PASS, {failed} FAIL")
+    return 0 if failed == 0 else 1
+
 
 if __name__ == "__main__":
     main()
